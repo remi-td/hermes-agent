@@ -11,6 +11,7 @@ These tests exercise the full run_job path (real imports, mocked AIAgent +
 resolve_runtime_provider against a temp HERMES_HOME) and the job-store pin helpers.
 """
 
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -35,7 +36,7 @@ def _base_job(**overrides):
 
 
 def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cron_model=None,
-         cron_model_provider=None):
+         cron_model_provider=None, extra_config=""):
     """Drive run_job against a temp config.yaml whose ``model.default`` / ``model.provider`` are
     the CURRENT global defaults. Returns ``(success, error, agent_kwargs, resolve_kwargs)`` where
     the last two are the kwargs AIAgent / resolve_runtime_provider were called with (None when
@@ -54,7 +55,7 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
         cron_lines.append(f"  model_provider: {cron_model_provider}")
     if cron_lines:
         config_yaml += "cron:\n" + "\n".join(cron_lines) + "\n"
-    (tmp_path / "config.yaml").write_text(config_yaml)
+    (tmp_path / "config.yaml").write_text(config_yaml + extra_config)
 
     resolve_kwargs = {}
 
@@ -68,7 +69,8 @@ def _run(job, tmp_path, *, current_provider="openrouter", current_model=None, cr
         }
 
     fake_db = MagicMock()
-    with patch("cron.scheduler._hermes_home", tmp_path), \
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}), \
+         patch("cron.scheduler._hermes_home", tmp_path), \
          patch("cron.scheduler._get_hermes_home", return_value=tmp_path), \
          patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
          patch("hermes_cli.env_loader.load_hermes_dotenv"), \
@@ -186,3 +188,94 @@ class TestRuntimeResolutionTargetModel:
         assert success is True, error
         assert resolve_kwargs["target_model"] == "my-pinned-model"
         assert resolve_kwargs["requested"] == "openrouter"
+
+
+class TestDirectAliases:
+    def test_primary_alias_expands_before_runtime_resolution(self, tmp_path):
+        success, error, agent_kwargs, resolve_kwargs = _run(
+            _base_job(model="cron-fast"),
+            tmp_path,
+            current_provider="default-provider",
+            current_model="default-model",
+            extra_config=(
+                "model_aliases:\n"
+                "  cron-fast:\n"
+                "    model: provider-a/real-primary\n"
+                "    provider: route-a\n"
+                "    base_url: https://primary.example.invalid/v1\n"
+            ),
+        )
+
+        assert success is True, error
+        assert agent_kwargs["model"] == "provider-a/real-primary"
+        # A URL-bearing direct alias is routed through the internal ``custom`` runtime owner.
+        assert resolve_kwargs["requested"] == "custom"
+        assert resolve_kwargs["target_model"] == "provider-a/real-primary"
+        assert resolve_kwargs["explicit_base_url"] == "https://primary.example.invalid/v1"
+
+    def test_fallback_chain_alias_expands_before_agent_setup(self, tmp_path, monkeypatch):
+        from cron.scheduler import _resolve_cron_fallback_chain
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "model_aliases:\n"
+            "  cron-fallback:\n"
+            "    model: provider-b/real-fallback\n"
+            "    provider: route-b\n"
+            "    base_url: https://fallback.example.invalid/v1\n"
+        )
+        import hermes_cli.model_switch as model_switch
+        model_switch._DIRECT_ALIAS_IDENTITY = None
+        model_switch.DIRECT_ALIASES.clear()
+
+        chain = _resolve_cron_fallback_chain({
+            "fallback_providers": [{"provider": "placeholder", "model": "cron-fallback"}]
+        })
+
+        assert chain == [{
+            # Explicit fallback provider pins retain precedence over an alias label.
+            "provider": "placeholder",
+            "model": "provider-b/real-fallback",
+            "base_url": "https://fallback.example.invalid/v1",
+        }]
+
+    def test_fallback_runtime_expands_alias_before_provider_resolution(self, tmp_path, monkeypatch):
+        from cron.scheduler import _CronJobConfig, _resolve_job_runtime
+        from hermes_cli.auth import AuthError
+        import hermes_cli.model_switch as model_switch
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "model_aliases:\n"
+            "  cron-fallback:\n"
+            "    model: provider-b/real-fallback\n"
+            "    provider: route-b\n"
+            "    base_url: https://fallback.example.invalid/v1\n"
+        )
+        model_switch._DIRECT_ALIAS_IDENTITY = None
+        model_switch.DIRECT_ALIASES.clear()
+        calls = []
+
+        def resolve(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise AuthError("primary unavailable")
+            return {"provider": kwargs["requested"]}
+
+        monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", resolve)
+        runtime, model = _resolve_job_runtime(
+            _base_job(model="primary", provider="primary-route"),
+            "alias-test",
+            _CronJobConfig(
+                cfg={"fallback_providers": [{"provider": "placeholder", "model": "cron-fallback"}]},
+                model="primary", model_cfg={}, cron_default_provider="",
+            ),
+        )
+
+        assert model == "provider-b/real-fallback"
+        assert runtime["provider"] == "placeholder"
+        assert calls[1] == {
+            "requested": "placeholder",
+            "target_model": "provider-b/real-fallback",
+            "explicit_base_url": "https://fallback.example.invalid/v1",
+        }

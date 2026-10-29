@@ -104,7 +104,8 @@ class GatewayTurnPrepareMixin:
         keeps a launch-policy session on its own route (see ``_resolve_policy_agent_runtime``)."""
         from gateway.run import (
             _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
-            _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
+            _resolve_direct_alias_agent_runtime, _resolve_runtime_agent_kwargs,
+            _resolve_runtime_agent_kwargs_for_provider,
         )
         from gateway.session_policy import policy_for_source
         # Every exit path starts clean: a stale notice must never attach to another session's next
@@ -135,6 +136,9 @@ class GatewayTurnPrepareMixin:
                     "Session model override (fast): session=%s config_model=%s -> override_model=%s provider=%s",
                     skey or "", model, override_model, override_runtime.get("provider"),
                 )
+                direct_alias_runtime = _resolve_direct_alias_agent_runtime(override_model)
+                if direct_alias_runtime is not None:
+                    return direct_alias_runtime
                 return override_model, override_runtime
             # No api_key on the override (credentials failed to re-resolve at rehydrate): resolve them
             # for the override's own provider below, never layer it over the default provider's runtime.
@@ -153,8 +157,27 @@ class GatewayTurnPrepareMixin:
                 ][:5] or "[]",
             )
 
-        runtime_kwargs, unavailable_override = None, None
-        if override and override.get("provider"):
+        cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
+        ch = None
+        if cfg and source is not None:
+            ch = _get_channel_override(
+                cfg, source.platform, str(source.chat_id) if source.chat_id else "",
+                thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+                parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+            )
+
+        # Establish precedence before resolving an alias.  A configured alias is
+        # an atomic route; resolving the default provider first can fail before
+        # a valid channel/session alias gets a chance to supply its own route.
+        selected_model = (override.get("model") if override and override.get("model")
+                          else ch.model if ch and ch.model else model)
+        direct_alias_runtime = _resolve_direct_alias_agent_runtime(selected_model)
+        if direct_alias_runtime is not None:
+            model, runtime_kwargs = direct_alias_runtime
+        else:
+            runtime_kwargs = None
+        unavailable_override = None
+        if runtime_kwargs is None and override and override.get("provider"):
             try:
                 runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
                     override["provider"], target_model=override.get("model") or None)
@@ -179,24 +202,17 @@ class GatewayTurnPrepareMixin:
             self._pre_agent_fallback_notice = pre_agent_fallback_notice(
                 unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
 
-        cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
-        if cfg and source is not None:
-            ch = _get_channel_override(
-                cfg, source.platform, str(source.chat_id) if source.chat_id else "",
-                thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
-                parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
-            )
-            if ch:
-                if ch.model:
-                    model = ch.model
-                if ch.provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider, target_model=model or None)
-                    ch_runtime_model = runtime_kwargs.pop("model", None)
-                    # Adopt the provider's bundled model only when the override named none.
-                    if ch_runtime_model and not ch.model:
-                        model = ch_runtime_model
+        if ch:
+            if ch.model and direct_alias_runtime is None:
+                model = ch.model
+            if ch.provider and direct_alias_runtime is None:
+                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider, target_model=model or None)
+                ch_runtime_model = runtime_kwargs.pop("model", None)
+                # Adopt the provider's bundled model only when the override named none.
+                if ch_runtime_model and not ch.model:
+                    model = ch_runtime_model
 
-        if override and skey:
+        if override and skey and direct_alias_runtime is None:
             model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
 
         # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the

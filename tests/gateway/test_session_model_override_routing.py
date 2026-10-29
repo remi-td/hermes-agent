@@ -140,3 +140,39 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "sk-openrouter"
 
 
+@pytest.mark.parametrize("route", ["default", "channel", "session"])
+def test_gateway_expands_direct_alias_after_route_precedence(monkeypatch, route):
+    """Aliases work for profile defaults, channel overrides, and persisted /model overrides."""
+    runner = _make_runner()
+    direct_runtime = {
+        "provider": "openrouter", "api_key": "alias-key",
+        "base_url": "https://openrouter.example/v1", "api_mode": "chat_completions",
+    }
+    monkeypatch.setattr(
+        gateway_run, "_resolve_direct_alias_agent_runtime",
+        lambda model: ("z-ai/glm-5.3-flash", dict(direct_runtime)) if model == "zdr-flash" else None,
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs",
+        lambda: (_ for _ in ()).throw(AssertionError("alias route must supply the runtime")),
+    )
+
+    source = None
+    config = {"model": {"default": "zdr-flash" if route == "default" else "other-model"}}
+    if route == "channel":
+        from gateway.config import ChannelOverride
+        runner.config = types.SimpleNamespace(platforms={
+            Platform.TELEGRAM: types.SimpleNamespace(channel_overrides={"chat": ChannelOverride(model="zdr-flash")}),
+        })
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
+    elif route == "session":
+        runner._session_model_overrides["session"] = {"model": "zdr-flash", "provider": "openrouter"}
+
+    model, runtime = runner._resolve_session_agent_runtime(
+        source=source, session_key="session" if route == "session" else None, user_config=config,
+    )
+
+    assert model == "z-ai/glm-5.3-flash"
+    assert runtime == direct_runtime
+
+

@@ -248,10 +248,13 @@ class TestRuntimeResolutionTargetModel:
             "  - provider: openrouter\n"
             "    model: fallback-alias\n"
         )
-        job = _base_job(model="primary-alias", provider="openrouter")
+        # Keep the job unpinned: only routes that may legally use the global
+        # fallback chain should receive its alias-expanded entries.
+        job = _base_job()
 
         success, error, agent_kwargs, resolve_kwargs = _run(
-            job, tmp_path, current_provider="openrouter", extra_config=aliases)
+            job, tmp_path, current_provider="openrouter", cron_model="primary-alias",
+            cron_model_provider="openrouter", extra_config=aliases)
 
         assert success is True, error
         assert agent_kwargs["model"] == "provider/primary-real"
